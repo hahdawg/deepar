@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch.distributions.normal import Normal
 from torch.distributions.negative_binomial import NegativeBinomial
@@ -48,6 +49,18 @@ class Encoder(nn.Module):
         _, (h, c) = self.lstm(x)
         return h, c
 
+    def sample(self, h, num_samples, factor):
+        """
+        Parameters
+        ----------
+        h: Tensor(shape=[batch_size, num_steps, hidden_size)
+
+        Returns
+        -------
+        Tensor(shape=[num_samples, batch_size, num_steps])
+        """
+        raise NotImplementedError()
+
 
 class Likelihood(nn.Module):
 
@@ -90,8 +103,7 @@ class Likelihood(nn.Module):
         -------
         Tensor(shape=[num_samples, batch_size, num_steps])
         """
-        mean, shape = self.transform(h, factor)
-        return self.distribution(mean, shape).sample(sample_shape=torch.Size([num_samples]))
+        raise NotImplementedError()
 
 
 class GaussianLikelihood(Likelihood):
@@ -117,6 +129,19 @@ class GaussianLikelihood(Likelihood):
         mu, sigma = self.transform(h, factor)
         return -self.distribution(mu, sigma).log_prob(y).mean()
 
+    def sample(self, h, num_samples, factor):
+        """
+        Parameters
+        ----------
+        h: Tensor(shape=[batch_size, num_steps, hidden_size)
+
+        Returns
+        -------
+        Tensor(shape=[num_samples, batch_size, num_steps])
+        """
+        mean, shape = self.transform(h, factor)
+        return self.distribution(mean, shape).sample(sample_shape=torch.Size([num_samples]))
+
 
 class NegativeBinomialLikelihood(Likelihood):
     """
@@ -132,17 +157,31 @@ class NegativeBinomialLikelihood(Likelihood):
         return self.softplus(h)
 
     def factor_transform(self, mean, shape, factor):
+        shape = shape + 1e-6
         mean = mean*factor
-        shape = shape/factor
-        return mean, shape
+        mean_shape = mean*shape
+        p = mean_shape/(1 + mean_shape)
+        r = 1/shape
+        return p, r
 
     def loss(self, h, y, factor):
-        mu, alpha = self.transform(h, factor)
-        alpha_mu = alpha*mu
-        p = alpha_mu/(1 + alpha_mu)
-        r = 1/alpha
+        p, r = self.transform(h, factor)
         loss = -self.distribution(total_count=r, probs=p).log_prob(y).mean()
-        return loss.mean()
+        return loss
+
+    def sample(self, h, num_samples, factor):
+        """
+        Parameters
+        ----------
+        h: Tensor(shape=[batch_size, num_steps, hidden_size)
+
+        Returns
+        -------
+        Tensor(shape=[num_samples, batch_size, num_steps])
+        """
+        p, r = self.transform(h, factor)
+        res = self.distribution(total_count=r, probs=p).sample(sample_shape=torch.Size([num_samples]))
+        return res
 
 
 class Decoder(nn.Module):
@@ -233,6 +272,7 @@ class Decoder(nn.Module):
                 num_samples=num_samples,
                 factor=factor
             )
+            yt = sample.mean(axis=0).float()
             preds.append(sample)
         preds = torch.stack(preds).permute(1, 2, 0)
         return preds
@@ -281,7 +321,7 @@ class DeepAR(nn.Module):
             _embedding=_embedding
         )
 
-    def forward(self, x_encode, cat_encode, y_encode, x_decode, cat_decode, y_decode, **kwargs):
+    def forward(self, x_encode, cat_encode, y_encode, x_decode, cat_decode, y_decode, factor, **kwargs):
         """
         Parameters
         ----------
@@ -292,8 +332,6 @@ class DeepAR(nn.Module):
         cat_decode: Tensor(shape=(batch_size, num_decode_steps))
         y_decode: Tensor(shape=(batch_size, num_decode_steps)
         """
-        if "factor" in kwargs:
-            factor = kwargs["factor"]
         y_encode /= factor
         y_decode /= factor
         h0, c0 = self.encoder(x=x_encode, cat=cat_encode, y=y_encode)
@@ -308,7 +346,8 @@ class DeepAR(nn.Module):
         x_decode,
         cat_decode,
         num_samples,
-        factor=1.0
+        factor,
+        **kwargs
     ):
         """
         Parameters
@@ -332,7 +371,7 @@ class DeepAR(nn.Module):
             y0=y_encode[:, -1],
             h0=h0,
             c0=c0,
-            factor=factor,
+            factor=factor.squeeze(),
             num_samples=num_samples
         )
 
@@ -375,6 +414,21 @@ class DeepARShared(DeepAR):
             _lstm=lstm,
             _embedding=embedding
         )
+
+
+def quantile_loss(y, y_hat, rho):
+    y = y.cpu().numpy()
+    y_hat = y_hat.cpu().numpy()
+    y_hat = np.percentile(y_hat, q=rho, axis=0)
+    rho /= 100.0
+    error = y_hat - y
+    over = error > 0
+    under = ~over
+    loss = error
+    loss[over] *= rho
+    loss[under] *= (rho - 1)
+    loss = 2*loss.sum(axis=0)/y.sum(axis=0)
+    return loss
 
 
 def run():

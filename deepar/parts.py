@@ -81,7 +81,8 @@ def generate_batches(
                 encode_start_idx = encode_end_idx - encode_len
 
             y_encode = ts_batch[:, encode_start_idx:encode_end_idx]
-            factor = 1 + y_encode.mean(axis=1).reshape(-1, 1)
+            # factor = 1 + y_encode.mean(axis=1).reshape(-1, 1)
+            factor = np.ones(y_encode.shape[0]).reshape(-1, 1)
             x_encode = x_batch[:, encode_start_idx:encode_end_idx, :]
             cat_encode = cat_batch[:, encode_start_idx:encode_end_idx]
 
@@ -117,7 +118,7 @@ def train():
     model_data = compute_model_data(load_raw_data())
     bg = generate_batches(
         model_data=model_data,
-        batch_size=256,
+        batch_size=128,
         istrain=True,
         encode_len=8,
         decode_len=8,
@@ -137,15 +138,16 @@ def train():
 
     optimizer = torch.optim.Adam(lr=1e-3, params=model.parameters())
 
-    checkpoint_freq = 2500
+    checkpoint_freq = 5000
     running_loss = deque(maxlen=checkpoint_freq)
     running_mae = deque(maxlen=checkpoint_freq)
+    running_ql = deque(maxlen=checkpoint_freq)
     for i, batch in enumerate(bg):
         optimizer.zero_grad()
         batch = next(bg)
         h = model(**batch)
-        batch["factor"] = 1.0
         factor = batch["factor"]
+        factor = torch.ones_like(factor)
         loss = model.decoder.likelihood.loss(h=h, y=batch["target_decode"], factor=factor)
         running_loss.append(loss.mean().item())
         loss.backward()
@@ -153,9 +155,22 @@ def train():
         optimizer.step()
 
         with torch.no_grad():
-            y_hat_b, _ = model.decoder.likelihood.transform(model(**batch), factor=factor)
-            mae = torch.abs(batch["target_decode"] - y_hat_b).mean().item()
+            y_hat_b = model.predict(**batch, num_samples=100)
+            mae = torch.abs(batch["target_decode"] - torch.mean(y_hat_b, dim=0)).mean().item()
             running_mae.append(mae)
 
+            ql = core.quantile_loss(
+                y=batch["target_decode"],
+                y_hat=y_hat_b,
+                rho=50
+            ).mean()
+            running_ql.append(ql)
+
         if i % checkpoint_freq == 0:
-            print(f"step: {i}  loss: {np.mean(running_loss):.5f}   mae: {mae:.5f}")
+            loss_mean = np.mean(running_loss)
+            mae_mean = np.mean(running_mae)
+            ql_mean = np.mean(running_ql)
+            print(f"step: {i}  loss: {loss_mean:.5f}   mae: {mae_mean:.5f}   ql: {ql_mean:.5f}")
+
+        if i == 3000000:
+            return model

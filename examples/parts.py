@@ -5,7 +5,7 @@ import sklearn.preprocessing as sp
 import torch
 import torch.nn as nn
 
-from . import core
+from deepar import core
 
 
 def load_raw_data():
